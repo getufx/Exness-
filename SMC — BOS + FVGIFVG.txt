@@ -1,0 +1,501 @@
+# indie:lang_version = 5
+from math import nan, isnan
+from indie import indicator, MainContext, param, color, Color, line_style, plot, Var, Optional
+from indie.algorithms import PivotHighLow, Atr
+from indie.drawings import LineSegment, Rectangle, AbsolutePosition
+
+MAX_FVG_CAPACITY = 10
+MAX_IFVG_CAPACITY = 7
+MAX_FBOS_CAPACITY = 10
+
+
+def _feq(a: float, b: float) -> bool:
+    if isnan(a) and isnan(b):
+        return True
+    return a == b
+
+
+def _rect_changed(cache: list[float], pat: float, pap: float, pbt: float, pbp: float) -> bool:
+    old_pap = cache[1]
+    new_pap = pap
+    if isnan(old_pap) and isnan(new_pap):
+        return False
+    if not _feq(cache[0], pat):
+        return True
+    if not _feq(old_pap, new_pap):
+        return True
+    if not _feq(cache[2], pbt):
+        return True
+    if not _feq(cache[3], pbp):
+        return True
+    return False
+
+
+def _make_cache(capacity: int) -> list[list[float]]:
+    result: list[list[float]] = []
+    i = 0
+    while i < capacity:
+        entry: list[float] = [0.0, nan, 0.0, nan]
+        result.append(entry)
+        i = i + 1
+    return result
+
+
+@indicator('SMC — BOS + FVG/IFVG', overlay_main_pane=True)
+@plot.line('_placeholder', color=color.TRANSPARENT)
+@param.int('length', default=5, min=1, max=20, title='Pivot Length')
+@param.int('max_fvgs', default=7, min=1, max=10, title='Max FVGs')
+@param.bool('show_fvgs', default=True, title='Show FVGs')
+@param.bool('show_ifvgs', default=True, title='Show IFVGs')
+@param.int('max_ifvgs', default=5, min=1, max=7, title='Max IFVGs')
+@param.str('mode', default='Present', options=['Present', 'Historical'], title='Mode')
+@param.int('max_failed_bos', default=5, min=1, max=10, title='Max Failed BOS')
+@param.float('fbos_filter_atr', default=0.4, min=0.4, max=2.0, title='Failed BOS ATR Filter')
+class Main(MainContext):
+    def __init__(self, length, max_fvgs, show_fvgs, show_ifvgs, max_ifvgs, mode, max_failed_bos, fbos_filter_atr):
+        self._last_ph_price: float = nan
+        self._last_ph_time: float = nan
+        self._last_pl_price: float = nan
+        self._last_pl_time: float = nan
+        self._last_bos_bull_price: float = nan
+        self._last_bos_bear_price: float = nan
+        empty_bos_bull: list[LineSegment] = []
+        self._lines_bos_bull: Var[list[LineSegment]] = self.new_var(empty_bos_bull)
+        empty_bos_bear: list[LineSegment] = []
+        self._lines_bos_bear: Var[list[LineSegment]] = self.new_var(empty_bos_bear)
+        gray = color.rgba(0, 0, 0, 2)
+        no_pos = AbsolutePosition(0.0, nan)
+        self._next_bos_bull_seg: LineSegment = LineSegment(
+            no_pos, no_pos,
+            color=gray, line_style=line_style.DOTTED, line_width=1,
+        )
+        self._next_bos_bear_seg: LineSegment = LineSegment(
+            no_pos, no_pos,
+            color=gray, line_style=line_style.DOTTED, line_width=1,
+        )
+        self._bos_bull_cache: list[float] = [0.0, nan, 0.0, nan]
+        self._bos_bear_cache: list[float] = [0.0, nan, 0.0, nan]
+        self._bull_fvg_t: list[float] = []
+        self._bull_fvg_top: list[float] = []
+        self._bull_fvg_bot: list[float] = []
+        self._bull_fvg_active: list[bool] = []
+        self._bull_fvg_end_t: list[float] = []
+        self._bear_fvg_t: list[float] = []
+        self._bear_fvg_top: list[float] = []
+        self._bear_fvg_bot: list[float] = []
+        self._bear_fvg_active: list[bool] = []
+        self._bear_fvg_end_t: list[float] = []
+        self._bull_ifvg_t: list[float] = []
+        self._bull_ifvg_top: list[float] = []
+        self._bull_ifvg_bot: list[float] = []
+        self._bull_ifvg_active: list[bool] = []
+        self._bull_ifvg_end_t: list[float] = []
+        self._bear_ifvg_t: list[float] = []
+        self._bear_ifvg_top: list[float] = []
+        self._bear_ifvg_bot: list[float] = []
+        self._bear_ifvg_active: list[bool] = []
+        self._bear_ifvg_end_t: list[float] = []
+        self._bull_fvg_rects: list[Rectangle] = []
+        self._bear_fvg_rects: list[Rectangle] = []
+        self._bull_ifvg_rects: list[Rectangle] = []
+        self._bear_ifvg_rects: list[Rectangle] = []
+        bull_fvg_bg = color.rgba(82, 250, 141, 1)
+        bear_fvg_bg = color.rgba(250, 82, 82, 1)
+        bull_ifvg_bg = color.rgba(82, 250, 141, 0.1)
+        bear_ifvg_bg = color.rgba(250, 82, 82, 0.1)
+        no_border = color.rgba(0, 0, 0, 0.0)
+        i = 0
+        while i < MAX_FVG_CAPACITY:
+            self._bull_fvg_rects.append(Rectangle(
+                AbsolutePosition(0.0, nan), AbsolutePosition(1.0, nan),
+                line_color=no_border, bg_color=bull_fvg_bg,
+                line_width=0, middle_line_width=0, middle_line_color=no_border,
+            ))
+            self._bear_fvg_rects.append(Rectangle(
+                AbsolutePosition(0.0, nan), AbsolutePosition(1.0, nan),
+                line_color=no_border, bg_color=bear_fvg_bg,
+                line_width=0, middle_line_width=0, middle_line_color=no_border,
+            ))
+            i = i + 1
+        i = 0
+        while i < MAX_IFVG_CAPACITY:
+            self._bull_ifvg_rects.append(Rectangle(
+                AbsolutePosition(0.0, nan), AbsolutePosition(1.0, nan),
+                line_color=no_border, bg_color=bull_ifvg_bg,
+                line_width=0, middle_line_width=0, middle_line_color=no_border,
+            ))
+            self._bear_ifvg_rects.append(Rectangle(
+                AbsolutePosition(0.0, nan), AbsolutePosition(1.0, nan),
+                line_color=no_border, bg_color=bear_ifvg_bg,
+                line_width=0, middle_line_width=0, middle_line_color=no_border,
+            ))
+            i = i + 1
+        self._last_fvg_bar: Var[int] = self.new_var(-1)
+        self._bull_fvg_cache: list[list[float]] = _make_cache(MAX_FVG_CAPACITY)
+        self._bear_fvg_cache: list[list[float]] = _make_cache(MAX_FVG_CAPACITY)
+        self._bull_ifvg_cache: list[list[float]] = _make_cache(MAX_IFVG_CAPACITY)
+        self._bear_ifvg_cache: list[list[float]] = _make_cache(MAX_IFVG_CAPACITY)
+        self._last_failed_bos_bull_price: float = nan
+        self._last_failed_bos_bear_price: float = nan
+        self._bull_fbos_t: list[float] = []
+        self._bull_fbos_top: list[float] = []
+        self._bull_fbos_bot: list[float] = []
+        self._bull_fbos_active: list[bool] = []
+        self._bull_fbos_end_t: list[float] = []
+        self._bear_fbos_t: list[float] = []
+        self._bear_fbos_top: list[float] = []
+        self._bear_fbos_bot: list[float] = []
+        self._bear_fbos_active: list[bool] = []
+        self._bear_fbos_end_t: list[float] = []
+        self._bull_fbos_rects: list[Rectangle] = []
+        self._bear_fbos_rects: list[Rectangle] = []
+        bull_fbos_bg = color.rgba(255, 200, 50, 0.25)
+        bear_fbos_bg = color.rgba(150, 50, 255, 0.25)
+        i = 0
+        while i < MAX_FBOS_CAPACITY:
+            self._bull_fbos_rects.append(Rectangle(
+                AbsolutePosition(0.0, nan), AbsolutePosition(1.0, nan),
+                line_color=no_border, bg_color=bull_fbos_bg,
+                line_width=0, middle_line_width=0, middle_line_color=no_border,
+            ))
+            self._bear_fbos_rects.append(Rectangle(
+                AbsolutePosition(0.0, nan), AbsolutePosition(1.0, nan),
+                line_color=no_border, bg_color=bear_fbos_bg,
+                line_width=0, middle_line_width=0, middle_line_color=no_border,
+            ))
+            i = i + 1
+        self._bull_fbos_cache: list[list[float]] = _make_cache(MAX_FBOS_CAPACITY)
+        self._bear_fbos_cache: list[list[float]] = _make_cache(MAX_FBOS_CAPACITY)
+
+    def _draw_bos_line(self, swing_time: float, swing_price: float, now_time: float,
+                       line_color: Color, lines_lst: Var[list[LineSegment]]) -> None:
+        seg = LineSegment(
+            AbsolutePosition(swing_time, swing_price),
+            AbsolutePosition(now_time, swing_price),
+            color=line_color,
+            line_style=line_style.DOTTED,
+            line_width=1,
+        )
+        self.chart.draw(seg)
+        lst = lines_lst.get()
+        if len(lst) >= 10:
+            self.chart.erase(lst[0])
+            del lst[0]
+        lst.append(seg)
+
+    def _add_gap(self, t_list: list[float], top_list: list[float], bot_list: list[float],
+             active_list: list[bool], end_list: list[float],
+             t: float, top: float, bot: float, max_len: int) -> None:
+        t_list.append(t)
+        top_list.append(top)
+        bot_list.append(bot)
+        active_list.append(True)
+        end_list.append(nan)
+        if len(t_list) > max_len:
+            remove_idx = 0
+            i = 0
+            while i < len(active_list) - 1:
+                if not active_list[i]:
+                    remove_idx = i
+                    break
+                i = i + 1
+            t_list.pop(remove_idx)
+            top_list.pop(remove_idx)
+            bot_list.pop(remove_idx)
+            active_list.pop(remove_idx)
+            end_list.pop(remove_idx)
+
+    def _add_fbos(self, t_list: list[float], top_list: list[float], bot_list: list[float],
+                  active_list: list[bool], end_list: list[float],
+                  t: float, top: float, bot: float, max_len: int) -> None:
+        t_list.append(t)
+        top_list.append(top)
+        bot_list.append(bot)
+        active_list.append(True)
+        end_list.append(nan)
+        if len(t_list) > max_len:
+            remove_idx = 0
+            i = 0
+            while i < len(active_list) - 1:
+                if not active_list[i]:
+                    remove_idx = i
+                    break
+                i = i + 1
+            t_list.pop(remove_idx)
+            top_list.pop(remove_idx)
+            bot_list.pop(remove_idx)
+            active_list.pop(remove_idx)
+            end_list.pop(remove_idx)
+
+    def _draw_rect_cached(self, rect: Rectangle, cache: list[float],
+                          pat: float, pap: float, pbt: float, pbp: float) -> None:
+        if _rect_changed(cache, pat, pap, pbt, pbp):
+            rect.point_a = AbsolutePosition(pat, pap)
+            rect.point_b = AbsolutePosition(pbt, pbp)
+            self.chart.draw(rect)
+            cache[0] = pat
+            cache[1] = pap
+            cache[2] = pbt
+            cache[3] = pbp
+
+    def calc(self, length: int, max_fvgs: int, show_fvgs: bool, show_ifvgs: bool, max_ifvgs: int, mode: str, max_failed_bos: int, fbos_filter_atr: float):
+        bar_idx = self.bar_index
+        t0 = self.time[0]
+        bar_duration_s = self.time_frame.to_minutes() * 60
+        hour_start = t0 - (t0 % 3600)
+        hour_end = hour_start + 3600
+
+        if bar_idx == 0:
+            i = 0
+            while i < MAX_FVG_CAPACITY:
+                self._bull_fvg_rects[i].point_a = AbsolutePosition(t0, nan)
+                self._bull_fvg_rects[i].point_b = AbsolutePosition(t0, nan)
+                self.chart.draw(self._bull_fvg_rects[i])
+                self._bear_fvg_rects[i].point_a = AbsolutePosition(t0, nan)
+                self._bear_fvg_rects[i].point_b = AbsolutePosition(t0, nan)
+                self.chart.draw(self._bear_fvg_rects[i])
+                i = i + 1
+            i = 0
+            while i < MAX_IFVG_CAPACITY:
+                self._bull_ifvg_rects[i].point_a = AbsolutePosition(t0, nan)
+                self._bull_ifvg_rects[i].point_b = AbsolutePosition(t0, nan)
+                self.chart.draw(self._bull_ifvg_rects[i])
+                self._bear_ifvg_rects[i].point_a = AbsolutePosition(t0, nan)
+                self._bear_ifvg_rects[i].point_b = AbsolutePosition(t0, nan)
+                self.chart.draw(self._bear_ifvg_rects[i])
+                i = i + 1
+            i = 0
+            while i < MAX_FBOS_CAPACITY:
+                self._bull_fbos_rects[i].point_a = AbsolutePosition(t0, nan)
+                self._bull_fbos_rects[i].point_b = AbsolutePosition(t0, nan)
+                self.chart.draw(self._bull_fbos_rects[i])
+                self._bear_fbos_rects[i].point_a = AbsolutePosition(t0, nan)
+                self._bear_fbos_rects[i].point_b = AbsolutePosition(t0, nan)
+                self.chart.draw(self._bear_fbos_rects[i])
+                i = i + 1
+            self.chart.draw(self._next_bos_bull_seg)
+            self.chart.draw(self._next_bos_bear_seg)
+
+        if self.is_closed_bar:
+            ph, _ = PivotHighLow.new(self.high, left_bars=length, right_bars=length)
+            _, pl = PivotHighLow.new(self.low, left_bars=length, right_bars=length)
+            now_time = self.time[0]
+            cur_close = self.close[0]
+            if not isnan(ph[0]):
+                self._last_ph_price = ph[0]
+                self._last_ph_time = self.time[length]
+            if not isnan(pl[0]):
+                self._last_pl_price = pl[0]
+                self._last_pl_time = self.time[length]
+            if not isnan(self._last_ph_price):
+                if cur_close > self._last_ph_price and self._last_ph_price != self._last_bos_bull_price:
+                    self._draw_bos_line(self._last_ph_time, self._last_ph_price, now_time, color.GREEN, self._lines_bos_bull)
+                    self._last_bos_bull_price = self._last_ph_price
+            if not isnan(self._last_pl_price):
+                if cur_close < self._last_pl_price and self._last_pl_price != self._last_bos_bear_price:
+                    self._draw_bos_line(self._last_pl_time, self._last_pl_price, now_time, color.RED, self._lines_bos_bear)
+                    self._last_bos_bear_price = self._last_pl_price
+            atr_series = Atr.new(14)
+            atr_val = atr_series[0]
+            half_height: float = nan
+            if not isnan(atr_val) and atr_val > 0.0:
+                half_height = atr_val * 0.5
+            if not isnan(self._last_ph_price):
+                if self.high[0] > self._last_ph_price and cur_close <= self._last_ph_price and (fbos_filter_atr == 0.0 or (not isnan(atr_val) and atr_val > 0.0 and (self.high[0] - self._last_ph_price) >= fbos_filter_atr * atr_val)):
+                    if self._last_ph_price != self._last_failed_bos_bull_price:
+                        swing_p = self._last_ph_price
+                        zone_top: float = swing_p + swing_p * 0.001
+                        zone_bot: float = swing_p - swing_p * 0.001
+                        if not isnan(half_height):
+                            zone_top = swing_p + half_height
+                            zone_bot = swing_p - half_height
+                        self._add_fbos(
+                            self._bull_fbos_t, self._bull_fbos_top, self._bull_fbos_bot,
+                            self._bull_fbos_active, self._bull_fbos_end_t,
+                            self._last_ph_time, zone_top, zone_bot, max_failed_bos,
+                        )
+                        self._last_failed_bos_bull_price = swing_p
+            if not isnan(self._last_pl_price):
+                if self.low[0] < self._last_pl_price and cur_close >= self._last_pl_price and (fbos_filter_atr == 0.0 or (not isnan(atr_val) and atr_val > 0.0 and (self._last_pl_price - self.low[0]) >= fbos_filter_atr * atr_val)):
+                    if self._last_pl_price != self._last_failed_bos_bear_price:
+                        swing_p = self._last_pl_price
+                        b_zone_top: float = swing_p + swing_p * 0.001
+                        b_zone_bot: float = swing_p - swing_p * 0.001
+                        if not isnan(half_height):
+                            b_zone_top = swing_p + half_height
+                            b_zone_bot = swing_p - half_height
+                        self._add_fbos(
+                            self._bear_fbos_t, self._bear_fbos_top, self._bear_fbos_bot,
+                            self._bear_fbos_active, self._bear_fbos_end_t,
+                            self._last_pl_time, b_zone_top, b_zone_bot, max_failed_bos,
+                        )
+                        self._last_failed_bos_bear_price = swing_p
+            i = 0
+            while i < len(self._bull_fbos_active):
+                if self._bull_fbos_active[i]:
+                    if cur_close > self._bull_fbos_top[i]:
+                        self._bull_fbos_active[i] = False
+                        self._bull_fbos_end_t[i] = t0
+                i = i + 1
+            i = 0
+            while i < len(self._bear_fbos_active):
+                if self._bear_fbos_active[i]:
+                    if cur_close < self._bear_fbos_bot[i]:
+                        self._bear_fbos_active[i] = False
+                        self._bear_fbos_end_t[i] = t0
+                i = i + 1
+            close0 = self.close[0]
+            if bar_idx >= 4 and bar_idx != self._last_fvg_bar.get():
+                self._last_fvg_bar.set(bar_idx)
+                if not isnan(self.low[1]) and not isnan(self.high[3]):
+                    if self.low[1] > self.high[3]:
+                        self._add_gap(self._bull_fvg_t, self._bull_fvg_top, self._bull_fvg_bot,
+                                      self._bull_fvg_active, self._bull_fvg_end_t,
+                                      self.time[2], self.low[1], self.high[3], max_fvgs)
+                if not isnan(self.high[1]) and not isnan(self.low[3]):
+                    if self.high[1] < self.low[3]:
+                        self._add_gap(self._bear_fvg_t, self._bear_fvg_top, self._bear_fvg_bot,
+                                      self._bear_fvg_active, self._bear_fvg_end_t,
+                                      self.time[2], self.low[3], self.high[1], max_fvgs)
+            i = 0
+            while i < len(self._bull_fvg_active):
+                if self._bull_fvg_active[i]:
+                    mitigated = False
+                    if close0 >= self._bull_fvg_bot[i] and close0 <= self._bull_fvg_top[i]:
+                        mitigated = True
+                    elif close0 < self._bull_fvg_bot[i]:
+                        mitigated = True
+                    if mitigated:
+                        self._bull_fvg_active[i] = False
+                        self._bull_fvg_end_t[i] = t0
+                        self._add_gap(self._bull_ifvg_t, self._bull_ifvg_top, self._bull_ifvg_bot,
+                                      self._bull_ifvg_active, self._bull_ifvg_end_t,
+                                      self._bull_fvg_t[i], self._bull_fvg_top[i], self._bull_fvg_bot[i], max_ifvgs)
+                i = i + 1
+            i = 0
+            while i < len(self._bear_fvg_active):
+                if self._bear_fvg_active[i]:
+                    mitigated = False
+                    if close0 >= self._bear_fvg_bot[i] and close0 <= self._bear_fvg_top[i]:
+                        mitigated = True
+                    elif close0 > self._bear_fvg_top[i]:
+                        mitigated = True
+                    if mitigated:
+                        self._bear_fvg_active[i] = False
+                        self._bear_fvg_end_t[i] = t0
+                        self._add_gap(self._bear_ifvg_t, self._bear_ifvg_top, self._bear_ifvg_bot,
+                                      self._bear_ifvg_active, self._bear_ifvg_end_t,
+                                      self._bear_fvg_t[i], self._bear_fvg_top[i], self._bear_fvg_bot[i], max_ifvgs)
+                i = i + 1
+            i = 0
+            while i < len(self._bull_ifvg_active):
+                if self._bull_ifvg_active[i]:
+                    if close0 > self._bull_ifvg_top[i]:
+                        self._bull_ifvg_active[i] = False
+                        self._bull_ifvg_end_t[i] = t0
+                i = i + 1
+            i = 0
+            while i < len(self._bear_ifvg_active):
+                if self._bear_ifvg_active[i]:
+                    if close0 < self._bear_ifvg_bot[i]:
+                        self._bear_ifvg_active[i] = False
+                        self._bear_ifvg_end_t[i] = t0
+                i = i + 1
+            i = 0
+            while i < MAX_FVG_CAPACITY:
+                if show_fvgs and i < len(self._bull_fvg_t) and (mode == 'Historical' or self._bull_fvg_active[i]):
+                    end_time = hour_end if self._bull_fvg_active[i] else self._bull_fvg_end_t[i] + bar_duration_s
+                    self._draw_rect_cached(self._bull_fvg_rects[i], self._bull_fvg_cache[i],
+                                           self._bull_fvg_t[i], self._bull_fvg_top[i], end_time, self._bull_fvg_bot[i])
+                else:
+                    self._draw_rect_cached(self._bull_fvg_rects[i], self._bull_fvg_cache[i],
+                                           t0, nan, t0, nan)
+                i = i + 1
+            i = 0
+            while i < MAX_FVG_CAPACITY:
+                if show_fvgs and i < len(self._bear_fvg_t) and (mode == 'Historical' or self._bear_fvg_active[i]):
+                    end_time = hour_end if self._bear_fvg_active[i] else self._bear_fvg_end_t[i] + bar_duration_s
+                    self._draw_rect_cached(self._bear_fvg_rects[i], self._bear_fvg_cache[i],
+                                           self._bear_fvg_t[i], self._bear_fvg_top[i], end_time, self._bear_fvg_bot[i])
+                else:
+                    self._draw_rect_cached(self._bear_fvg_rects[i], self._bear_fvg_cache[i],
+                                           t0, nan, t0, nan)
+                i = i + 1
+            i = 0
+            while i < MAX_IFVG_CAPACITY:
+                if show_ifvgs and i < len(self._bull_ifvg_t) and (mode == 'Historical' or self._bull_ifvg_active[i]):
+                    end_time = hour_end if self._bull_ifvg_active[i] else self._bull_ifvg_end_t[i] + bar_duration_s
+                    self._draw_rect_cached(self._bull_ifvg_rects[i], self._bull_ifvg_cache[i],
+                                           self._bull_ifvg_t[i], self._bull_ifvg_top[i], end_time, self._bull_ifvg_bot[i])
+                else:
+                    self._draw_rect_cached(self._bull_ifvg_rects[i], self._bull_ifvg_cache[i],
+                                           t0, nan, t0, nan)
+                i = i + 1
+            i = 0
+            while i < MAX_IFVG_CAPACITY:
+                if show_ifvgs and i < len(self._bear_ifvg_t) and (mode == 'Historical' or self._bear_ifvg_active[i]):
+                    end_time = hour_end if self._bear_ifvg_active[i] else self._bear_ifvg_end_t[i] + bar_duration_s
+                    self._draw_rect_cached(self._bear_ifvg_rects[i], self._bear_ifvg_cache[i],
+                                           self._bear_ifvg_t[i], self._bear_ifvg_top[i], end_time, self._bear_ifvg_bot[i])
+                else:
+                    self._draw_rect_cached(self._bear_ifvg_rects[i], self._bear_ifvg_cache[i],
+                                           t0, nan, t0, nan)
+                i = i + 1
+            i = 0
+            while i < MAX_FBOS_CAPACITY:
+                if i < len(self._bull_fbos_t) and (mode == 'Historical' or self._bull_fbos_active[i]):
+                    end_time = hour_end if self._bull_fbos_active[i] else self._bull_fbos_end_t[i] + bar_duration_s
+                    self._draw_rect_cached(self._bull_fbos_rects[i], self._bull_fbos_cache[i],
+                                           self._bull_fbos_t[i], self._bull_fbos_top[i], end_time, self._bull_fbos_bot[i])
+                else:
+                    self._draw_rect_cached(self._bull_fbos_rects[i], self._bull_fbos_cache[i],
+                                           t0, nan, t0, nan)
+                i = i + 1
+            i = 0
+            while i < MAX_FBOS_CAPACITY:
+                if i < len(self._bear_fbos_t) and (mode == 'Historical' or self._bear_fbos_active[i]):
+                    end_time = hour_end if self._bear_fbos_active[i] else self._bear_fbos_end_t[i] + bar_duration_s
+                    self._draw_rect_cached(self._bear_fbos_rects[i], self._bear_fbos_cache[i],
+                                           self._bear_fbos_t[i], self._bear_fbos_top[i], end_time, self._bear_fbos_bot[i])
+                else:
+                    self._draw_rect_cached(self._bear_fbos_rects[i], self._bear_fbos_cache[i],
+                                           t0, nan, t0, nan)
+                i = i + 1
+
+        has_bull = not isnan(self._last_ph_price) and self._last_ph_price != self._last_bos_bull_price
+        has_bear = not isnan(self._last_pl_price) and self._last_pl_price != self._last_bos_bear_price
+        bull_pat: float = t0
+        bull_pap: float = nan
+        bull_pbt: float = t0
+        bull_pbp: float = nan
+        if has_bull:
+            bull_pat = self._last_ph_time
+            bull_pap = self._last_ph_price
+            bull_pbt = hour_end
+            bull_pbp = self._last_ph_price
+        if _rect_changed(self._bos_bull_cache, bull_pat, bull_pap, bull_pbt, bull_pbp):
+            self._next_bos_bull_seg.point_a = AbsolutePosition(bull_pat, bull_pap)
+            self._next_bos_bull_seg.point_b = AbsolutePosition(bull_pbt, bull_pbp)
+            self.chart.draw(self._next_bos_bull_seg)
+            self._bos_bull_cache[0] = bull_pat
+            self._bos_bull_cache[1] = bull_pap
+            self._bos_bull_cache[2] = bull_pbt
+            self._bos_bull_cache[3] = bull_pbp
+        bear_pat: float = t0
+        bear_pap: float = nan
+        bear_pbt: float = t0
+        bear_pbp: float = nan
+        if has_bear:
+            bear_pat = self._last_pl_time
+            bear_pap = self._last_pl_price
+            bear_pbt = hour_end
+            bear_pbp = self._last_pl_price
+        if _rect_changed(self._bos_bear_cache, bear_pat, bear_pap, bear_pbt, bear_pbp):
+            self._next_bos_bear_seg.point_a = AbsolutePosition(bear_pat, bear_pap)
+            self._next_bos_bear_seg.point_b = AbsolutePosition(bear_pbt, bear_pbp)
+            self.chart.draw(self._next_bos_bear_seg)
+            self._bos_bear_cache[0] = bear_pat
+            self._bos_bear_cache[1] = bear_pap
+            self._bos_bear_cache[2] = bear_pbt
+            self._bos_bear_cache[3] = bear_pbp
+        return nan

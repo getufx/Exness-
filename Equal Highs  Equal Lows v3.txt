@@ -1,0 +1,352 @@
+# indie:lang_version = 5
+#
+# Equal Highs / Equal Lows v3 update
+# Lines extend to end-of-day (midnight UTC of the next calendar day).
+#
+# Key design decisions:
+# - Everything — detection, invalidation, and drawing — runs on candle close
+# only (is_closed_bar guard at the top of calc). No intra-bar updates.
+# - Candidates: every confirmed pivot is stored in a rolling buffer
+# (MAX_CANDIDATES = 20). A new pivot is compared against all existing
+# candidates; if it falls within tolerance_pct it promotes the pair into
+#   an EQH/EQL level via _merge_or_add_*.
+# - Merging: when a new pivot matches an existing active level its price is
+#   averaged in (running mean) and the start time is extended if earlier.
+# - Invalidation: a level is deactivated only when close moves BEYOND it by
+#   more than tolerance_pct (buffered invalidation). A price touch alone does
+#   not remove the line.
+# - Pivot detection uses asymmetric bars: left_bars=pivot_length for structure
+#   quality, right_bars=confirm_bars (default 2) to cut confirmation lag.
+# - Capacity: at most MAX_LEVELS_CAPACITY (10) lines are kept; the oldest
+#   inactive slot is evicted when the list overflows.
+# - Line endpoint: point_b is anchored to midnight UTC of the next calendar
+#   day so all active lines extend to end-of-day regardless of bar count.
+# - draw() is called on EVERY bar for every active slot, ensuring immediate
+#   visibility. The dirty flag guards only property mutations and state tracking.
+# - Label is drawn in the same branch as its line — a label never appears
+#   without its line and vice versa.
+from math import nan, isnan
+from datetime import datetime, timedelta
+from indie import indicator, MainContext, param, color, Color, line_style, plot
+from indie.algorithms import PivotHighLow
+from indie.drawings import LineSegment, AbsolutePosition, LabelAbs, callout_position
+MAX_LEVELS_CAPACITY = 10
+MAX_CANDIDATES = 20
+_EQH_COLOR = color.rgba(0, 0, 0, 0.5)
+_EQL_COLOR = color.rgba(0, 0, 0, 0.5)
+@indicator('EQ', overlay_main_pane=True)
+@plot.line('_placeholder', color=color.TRANSPARENT)
+@param.int('pivot_length', default=5, min=1, max=20, title='Pivot Length')
+@param.int('confirm_bars', default=2, min=1, max=10, title='Confirm Bars (right side)')
+@param.float('tolerance_pct', default=0.1, min=0.01, max=1.0, title='Tolerance %')
+@param.int('max_levels', default=10, min=1, max=10, title='Max Levels')
+@param.bool('show_eqh', default=True, title='Show EQH')
+@param.bool('show_eql', default=True, title='Show EQL')
+class Main(MainContext):
+    def __init__(self, pivot_length, confirm_bars, tolerance_pct, max_levels, show_eqh, show_eql):
+        self._ph_cand_prices: list[float] = []
+        self._ph_cand_times: list[float] = []
+        self._pl_cand_prices: list[float] = []
+        self._pl_cand_times: list[float] = []
+        self._eqh_prices: list[float] = []
+        self._eqh_counts: list[int] = []
+        self._eqh_start_times: list[float] = []
+        self._eqh_active: list[bool] = []
+        self._eql_prices: list[float] = []
+        self._eql_counts: list[int] = []
+        self._eql_start_times: list[float] = []
+        self._eql_active: list[bool] = []
+        self._eqh_lines: list[LineSegment] = []
+        self._eql_lines: list[LineSegment] = []
+        self._eqh_labels: list[LabelAbs] = []
+        self._eql_labels: list[LabelAbs] = []
+        i = 0
+        while i < MAX_LEVELS_CAPACITY:
+            self._eqh_lines.append(LineSegment(
+                AbsolutePosition(0.0, nan),
+                AbsolutePosition(0.0, nan),
+                color=_EQH_COLOR,
+                line_style=line_style.SOLID,
+                line_width=1,
+            ))
+            self._eql_lines.append(LineSegment(
+                AbsolutePosition(0.0, nan),
+                AbsolutePosition(0.0, nan),
+                color=_EQL_COLOR,
+                line_style=line_style.SOLID,
+                line_width=1,
+            ))
+            self._eqh_labels.append(LabelAbs(
+                "",
+                AbsolutePosition(0.0, nan),
+                font_size=12,
+                text_color=_EQH_COLOR,
+                bg_color=color.TRANSPARENT,
+                callout_position=callout_position.TOP_RIGHT,
+            ))
+            self._eql_labels.append(LabelAbs(
+                "",
+                AbsolutePosition(0.0, nan),
+                font_size=12,
+                text_color=_EQL_COLOR,
+                bg_color=color.TRANSPARENT,
+                callout_position=callout_position.BOTTOM_RIGHT,
+            ))
+            i = i + 1
+        self._eqh_was_active: list[bool] = []
+        self._eql_was_active: list[bool] = []
+        self._eqh_prev_price: list[float] = []
+        self._eql_prev_price: list[float] = []
+        self._eqh_prev_start: list[float] = []
+        self._eql_prev_start: list[float] = []
+        self._eqh_break_count: list[int] = []
+        self._eql_break_count: list[int] = []
+        self._eqh_prev_count: list[int] = []
+        self._eql_prev_count: list[int] = []
+        j = 0
+        while j < MAX_LEVELS_CAPACITY:
+            self._eqh_was_active.append(False)
+            self._eql_was_active.append(False)
+            self._eqh_prev_price.append(nan)
+            self._eql_prev_price.append(nan)
+            self._eqh_prev_start.append(nan)
+            self._eql_prev_start.append(nan)
+            self._eqh_break_count.append(0)
+            self._eql_break_count.append(0)
+            self._eqh_prev_count.append(0)
+            self._eql_prev_count.append(0)
+            j = j + 1
+        self._last_pivot_bar: int = -1
+        self._last_closed_time: float = nan
+        self._prev_eod_time: float = nan
+
+    def _end_of_day(self, ts: float) -> float:
+        dt = datetime.utcfromtimestamp(ts)
+        next_midnight = datetime(year=dt.year, month=dt.month, day=dt.day) + timedelta(days=1)
+        return next_midnight.timestamp()
+
+    def _evict_slot(self, active_list: list[bool]) -> int:
+        i = 0
+        while i < len(active_list):
+            if not active_list[i]:
+                return i
+            i = i + 1
+        return 0
+
+    def _merge_or_add_eqh(self, price: float, t_start: float,
+                           tolerance_pct: float, max_len: int) -> None:
+        i = 0
+        while i < len(self._eqh_prices):
+            if self._eqh_active[i]:
+                diff_pct = abs(price - self._eqh_prices[i]) / self._eqh_prices[i] * 100.0
+                if diff_pct <= tolerance_pct:
+                    n = self._eqh_counts[i]
+                    self._eqh_prices[i] = (self._eqh_prices[i] * n + price) / (n + 1)
+                    self._eqh_counts[i] = n + 1
+                    if t_start < self._eqh_start_times[i]:
+                        self._eqh_start_times[i] = t_start
+                    return
+            i = i + 1
+        if len(self._eqh_prices) < max_len:
+            self._eqh_prices.append(price)
+            self._eqh_counts.append(1)
+            self._eqh_start_times.append(t_start)
+            self._eqh_active.append(True)
+        else:
+            idx = self._evict_slot(self._eqh_active)
+            self._eqh_prices[idx] = price
+            self._eqh_counts[idx] = 1
+            self._eqh_start_times[idx] = t_start
+            self._eqh_active[idx] = True
+
+    def _merge_or_add_eql(self, price: float, t_start: float,
+                           tolerance_pct: float, max_len: int) -> None:
+        i = 0
+        while i < len(self._eql_prices):
+            if self._eql_active[i]:
+                diff_pct = abs(price - self._eql_prices[i]) / self._eql_prices[i] * 100.0
+                if diff_pct <= tolerance_pct:
+                    n = self._eql_counts[i]
+                    self._eql_prices[i] = (self._eql_prices[i] * n + price) / (n + 1)
+                    self._eql_counts[i] = n + 1
+                    if t_start < self._eql_start_times[i]:
+                        self._eql_start_times[i] = t_start
+                    return
+            i = i + 1
+        if len(self._eql_prices) < max_len:
+            self._eql_prices.append(price)
+            self._eql_counts.append(1)
+            self._eql_start_times.append(t_start)
+            self._eql_active.append(True)
+        else:
+            idx = self._evict_slot(self._eql_active)
+            self._eql_prices[idx] = price
+            self._eql_counts[idx] = 1
+            self._eql_start_times[idx] = t_start
+            self._eql_active[idx] = True
+
+    def _add_candidate(self, cand_prices: list[float], cand_times: list[float],
+                        price: float, t: float) -> None:
+        cand_prices.append(price)
+        cand_times.append(t)
+        if len(cand_prices) > MAX_CANDIDATES:
+            del cand_prices[0]
+            del cand_times[0]
+
+    def calc(self, pivot_length, confirm_bars, tolerance_pct, max_levels, show_eqh, show_eql):
+        if not self.is_closed_bar:
+            return nan
+        closed_time = self.time[0]
+        self._last_closed_time = closed_time
+        end_of_day_time = self._end_of_day(closed_time)
+        cur_close = self.close[0]
+        bar_idx = self.bar_index
+        ph, _ = PivotHighLow.new(self.high, left_bars=pivot_length, right_bars=confirm_bars)
+        _, pl = PivotHighLow.new(self.low, left_bars=pivot_length, right_bars=confirm_bars)
+        if bar_idx != self._last_pivot_bar and bar_idx >= pivot_length:
+            self._last_pivot_bar = bar_idx
+            pivot_time = self.time[pivot_length]
+            if not isnan(ph[0]):
+                new_ph = ph[0]
+                i = 0
+                while i < len(self._ph_cand_prices):
+                    stored_price = self._ph_cand_prices[i]
+                    if not isnan(stored_price) and stored_price > 0.0:
+                        diff_pct = abs(new_ph - stored_price) / stored_price * 100.0
+                        if diff_pct <= tolerance_pct:
+                            self._merge_or_add_eqh(
+                                new_ph, self._ph_cand_times[i],
+                                tolerance_pct, max_levels,
+                            )
+                            break
+                    i = i + 1
+                self._add_candidate(self._ph_cand_prices, self._ph_cand_times, new_ph, pivot_time)
+            if not isnan(pl[0]):
+                new_pl = pl[0]
+                i = 0
+                while i < len(self._pl_cand_prices):
+                    stored_price = self._pl_cand_prices[i]
+                    if not isnan(stored_price) and stored_price > 0.0:
+                        diff_pct = abs(new_pl - stored_price) / stored_price * 100.0
+                        if diff_pct <= tolerance_pct:
+                            self._merge_or_add_eql(
+                                new_pl, self._pl_cand_times[i],
+                                tolerance_pct, max_levels,
+                            )
+                            break
+                    i = i + 1
+                self._add_candidate(self._pl_cand_prices, self._pl_cand_times, new_pl, pivot_time)
+        # Buffered invalidation — level only breaks when close moves BEYOND it
+        # by more than tolerance_pct. A price touch alone does not remove the line.
+        # Break confirmation: require 1 consecutive closing bar beyond the threshold
+        # before deactivating, so a single wick-driven close cannot flicker the line.
+        i = 0
+        while i < len(self._eqh_active):
+            if self._eqh_active[i]:
+                threshold = self._eqh_prices[i] * (1.0 + tolerance_pct / 100.0)
+                if cur_close > threshold:
+                    self._eqh_break_count[i] = self._eqh_break_count[i] + 1
+                else:
+                    self._eqh_break_count[i] = 0
+                if self._eqh_break_count[i] >= 1 and cur_close > threshold:
+                    self._eqh_active[i] = False
+                    self._eqh_break_count[i] = 0
+            i = i + 1
+        i = 0
+        while i < len(self._eql_active):
+            if self._eql_active[i]:
+                threshold = self._eql_prices[i] * (1.0 - tolerance_pct / 100.0)
+                if cur_close < threshold:
+                    self._eql_break_count[i] = self._eql_break_count[i] + 1
+                else:
+                    self._eql_break_count[i] = 0
+                if self._eql_break_count[i] >= 1 and cur_close < threshold:
+                    self._eql_active[i] = False
+                    self._eql_break_count[i] = 0
+            i = i + 1
+        prev_eod = self._prev_eod_time
+        day_rolled = not isnan(prev_eod) and end_of_day_time != prev_eod
+        self._prev_eod_time = end_of_day_time
+        slot = 0
+        while slot < MAX_LEVELS_CAPACITY:
+            line = self._eqh_lines[slot]
+            lbl = self._eqh_labels[slot]
+            count = self._eqh_counts[slot] if slot < len(self._eqh_counts) else 0
+            is_active = show_eqh and slot < len(self._eqh_prices) and self._eqh_active[slot] and count >= 2
+            was_active = self._eqh_was_active[slot]
+            if is_active:
+                price = self._eqh_prices[slot]
+                t_start = self._eqh_start_times[slot]
+                dirty = (
+                    not was_active
+                    or price != self._eqh_prev_price[slot]
+                    or t_start != self._eqh_prev_start[slot]
+                    or count != self._eqh_prev_count[slot]
+                    or day_rolled
+                )
+                if dirty:
+                    line.point_a = AbsolutePosition(t_start, price)
+                    line.point_b = AbsolutePosition(end_of_day_time, price)
+                    lbl.position = AbsolutePosition(end_of_day_time, price)
+                    lbl.text = str(count) + "x"
+                    self._eqh_was_active[slot] = True
+                    self._eqh_prev_price[slot] = price
+                    self._eqh_prev_start[slot] = t_start
+                    self._eqh_prev_count[slot] = count
+                self.chart.draw(line)
+                self.chart.draw(lbl)
+            else:
+                if was_active:
+                    line.point_a = AbsolutePosition(end_of_day_time, nan)
+                    line.point_b = AbsolutePosition(end_of_day_time, nan)
+                    lbl.position = AbsolutePosition(end_of_day_time, nan)
+                    lbl.text = ""
+                    self._eqh_was_active[slot] = False
+                    self._eqh_prev_price[slot] = nan
+                    self._eqh_prev_start[slot] = nan
+                    self._eqh_prev_count[slot] = 0
+                self.chart.draw(line)
+                self.chart.draw(lbl)
+            slot = slot + 1
+        slot = 0
+        while slot < MAX_LEVELS_CAPACITY:
+            line = self._eql_lines[slot]
+            lbl = self._eql_labels[slot]
+            count = self._eql_counts[slot] if slot < len(self._eql_counts) else 0
+            is_active = show_eql and slot < len(self._eql_prices) and self._eql_active[slot] and count >= 2
+            was_active = self._eql_was_active[slot]
+            if is_active:
+                price = self._eql_prices[slot]
+                t_start = self._eql_start_times[slot]
+                dirty = (
+                    not was_active
+                    or price != self._eql_prev_price[slot]
+                    or t_start != self._eql_prev_start[slot]
+                    or count != self._eql_prev_count[slot]
+                    or day_rolled
+                )
+                if dirty:
+                    line.point_a = AbsolutePosition(t_start, price)
+                    line.point_b = AbsolutePosition(end_of_day_time, price)
+                    lbl.position = AbsolutePosition(end_of_day_time, price)
+                    lbl.text = str(count) + "x"
+                    self._eql_was_active[slot] = True
+                    self._eql_prev_price[slot] = price
+                    self._eql_prev_start[slot] = t_start
+                    self._eql_prev_count[slot] = count
+                self.chart.draw(line)
+                self.chart.draw(lbl)
+            else:
+                if was_active:
+                    line.point_a = AbsolutePosition(end_of_day_time, nan)
+                    line.point_b = AbsolutePosition(end_of_day_time, nan)
+                    lbl.position = AbsolutePosition(end_of_day_time, nan)
+                    lbl.text = ""
+                    self._eql_was_active[slot] = False
+                    self._eql_prev_price[slot] = nan
+                    self._eql_prev_start[slot] = nan
+                    self._eql_prev_count[slot] = 0
+                self.chart.draw(line)
+                self.chart.draw(lbl)
+            slot = slot + 1
+        return nan

@@ -1,0 +1,56 @@
+# indie:lang_version = 5
+from indie import indicator, param, color, plot, MutSeriesF, line_style
+from indie.algorithms import LinReg, Ema, Atr
+from math import nan
+
+@indicator('Trend Prediction Line', overlay_main_pane=True)
+@param.int('length', default=20, min=5, max=500, title='LinReg Length')
+@param.int('ema_length', default=10, min=2, max=100, title='Signal EMA Length')
+@param.int('atr_length', default=14, min=1, max=100, title='ATR Length')
+@param.float('atr_mult', default=2.0, min=0.1, max=10.0, step=0.1, title='ATR Multiplier')
+@param.bool('show_bands', default=True, title='Show ATR Bands')
+@plot.line('trend', line_width=2)
+@plot.line('signal', color=color.rgba(255, 200, 0, 1.0))
+@plot.line('upper', color=color.rgba(100, 180, 255, 0.8), line_style=line_style.DASHED)
+@plot.line('lower', color=color.rgba(100, 180, 255, 0.8), line_style=line_style.DASHED)
+@plot.line('prediction', color=color.rgba(255, 220, 80, 0.7), line_style=line_style.DOTTED)
+@plot.line('momentum', color=color.rgba(180, 100, 255, 0.9))
+@plot.fill('upper', 'lower', color=color.BLUE(0.08))
+def Main(self, length, ema_length, atr_length, atr_mult, show_bands):
+    src = self.hlc3
+
+    lr = LinReg.new(src, length, 0)
+    signal = Ema.new(lr, ema_length)
+    atr = Atr.new(atr_length)
+
+    slope_s = MutSeriesF.new(lr[0] - lr[1])
+
+    slope = slope_s[0]
+    momentum = Ema.new(slope_s, ema_length)
+
+    upper_val = nan
+    lower_val = nan
+    if show_bands:
+        upper_val = lr[0] + atr_mult * atr[0]
+        lower_val = lr[0] - atr_mult * atr[0]
+
+    predicted = lr[0] + slope
+
+    trend_color = color.GRAY
+    fill_color = color.GRAY(0.05)
+    if slope > 0.0:
+        trend_color = color.LIME
+        fill_color = color.GREEN(0.08)
+    elif slope < 0.0:
+        trend_color = color.RED
+        fill_color = color.RED(0.08)
+
+    return (
+        plot.Line(lr[0], color=trend_color),
+        signal[0],
+        upper_val,
+        lower_val,
+        predicted,
+        nan,          # momentum hidden — calculation intact
+        plot.Fill(color=fill_color),
+    )

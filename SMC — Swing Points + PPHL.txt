@@ -1,0 +1,462 @@
+# indie:lang_version = 5
+from math import nan, isnan
+from datetime import datetime
+from indie import indicator, MainContext, param, color, Color, line_style, plot, Var
+from indie.algorithms import PivotHighLow
+from indie.drawings import LineSegment, AbsolutePosition
+
+MAX_SWING_CAPACITY = 10
+PPHL_MAX_SHOWN = 3
+
+COLOR_PPHL_GRAY = color.rgba(150, 150, 150, 1)
+
+
+@indicator('SMC — Swing Points + PPHL', overlay_main_pane=True)
+@plot.line('_placeholder', color=color.TRANSPARENT)
+@param.int('length', default=5, min=1, max=20, title='Pivot Length')
+@param.bool('show_prev_day', default=True, title='Show Prev Day H/L')
+@param.bool('show_prev_week', default=True, title='Show Prev Week H/L')
+@param.bool('show_prev_month', default=True, title='Show Prev Month H/L')
+@param.bool('show_prev_year', default=True, title='Show Prev Year H/L')
+class Main(MainContext):
+    def __init__(self, length, show_prev_day, show_prev_week, show_prev_month, show_prev_year):
+        # ── Swing-point pivot tracking ────────────────────────────────────────
+        self._last_ph_price: float = nan
+        self._last_ph_time: float = nan
+        self._last_pl_price: float = nan
+        self._last_pl_time: float = nan
+
+        # ── Swing-point line state ────────────────────────────────────────────
+        empty_swing_high: list[LineSegment] = []
+        self._lines_swing_high: Var[list[LineSegment]] = self.new_var(empty_swing_high)
+        empty_swing_low: list[LineSegment] = []
+        self._lines_swing_low: Var[list[LineSegment]] = self.new_var(empty_swing_low)
+        self._swing_high_prices: list[float] = []
+        self._swing_low_prices: list[float] = []
+
+        # ── PPHL datetime-boundary state ──────────────────────────────────────
+        self._cur_day_high: float = nan
+        self._cur_day_low: float = nan
+        self._cur_day_start_t: float = nan
+        self._cur_week_high: float = nan
+        self._cur_week_low: float = nan
+        self._cur_week_start_t: float = nan
+        self._cur_month_high: float = nan
+        self._cur_month_low: float = nan
+        self._cur_month_start_t: float = nan
+        self._cur_year_high: float = nan
+        self._cur_year_low: float = nan
+        self._cur_year_start_t: float = nan
+
+        # Last-seen period boundary identifiers (for rollover detection)
+        self._last_day: int = -1
+        self._last_day_year: int = -1
+        self._last_weekday: int = -1
+        self._last_month: int = -1
+        self._last_month_year: int = -1
+        self._last_year: int = -1
+
+        # Rolling buffers of completed-period H/L (up to PPHL_MAX_SHOWN each)
+        self._day_h_prices: list[float] = []
+        self._day_h_t: list[float] = []
+        self._day_h_lines: list[LineSegment] = []
+
+        self._day_l_prices: list[float] = []
+        self._day_l_t: list[float] = []
+        self._day_l_lines: list[LineSegment] = []
+
+        self._week_h_prices: list[float] = []
+        self._week_h_t: list[float] = []
+        self._week_h_lines: list[LineSegment] = []
+
+        self._week_l_prices: list[float] = []
+        self._week_l_t: list[float] = []
+        self._week_l_lines: list[LineSegment] = []
+
+        self._month_h_prices: list[float] = []
+        self._month_h_t: list[float] = []
+        self._month_h_lines: list[LineSegment] = []
+
+        self._month_l_prices: list[float] = []
+        self._month_l_t: list[float] = []
+        self._month_l_lines: list[LineSegment] = []
+
+        self._year_h_prices: list[float] = []
+        self._year_h_t: list[float] = []
+        self._year_h_lines: list[LineSegment] = []
+
+        self._year_l_prices: list[float] = []
+        self._year_l_t: list[float] = []
+        self._year_l_lines: list[LineSegment] = []
+
+        # Mitigation window counters: bars elapsed since last period rollover
+        # Mitigation only runs while counter <= 3; resets to 0 on rollover then increments to 1
+        self._day_mitigate_bars: int = 0
+        self._week_mitigate_bars: int = 0
+        self._month_mitigate_bars: int = 0
+        self._year_mitigate_bars: int = 0
+
+    # ── Swing-point line helper ───────────────────────────────────────────────
+    def _add_swing_line(self, pivot_time: float, pivot_price: float, next_end: float,
+                        seg_color: Color, lines_var: Var[list[LineSegment]],
+                        prices_list: list[float]) -> None:
+        seg = LineSegment(
+            AbsolutePosition(pivot_time, pivot_price),
+            AbsolutePosition(next_end, pivot_price),
+            color=seg_color,
+            line_style=line_style.SOLID,
+            line_width=1,
+        )
+        self.chart.draw(seg)
+        lst = lines_var.get()
+        if len(lst) >= MAX_SWING_CAPACITY:
+            self.chart.erase(lst[0])
+            del lst[0]
+            del prices_list[0]
+        lst.append(seg)
+        prices_list.append(pivot_price)
+
+    # ── PPHL: push a completed period's high onto rolling buffer ──────────────
+    def _pphl_push_high(self, prices: list[float], times: list[float],
+                        lines: list[LineSegment],
+                        price: float, period_start_t: float,
+                        next_end: float) -> None:
+        if len(prices) >= PPHL_MAX_SHOWN:
+            self.chart.erase(lines[0])
+            del prices[0]
+            del times[0]
+            del lines[0]
+        seg = LineSegment(
+            AbsolutePosition(period_start_t, price),
+            AbsolutePosition(next_end, price),
+            color=COLOR_PPHL_GRAY,
+            line_style=line_style.SOLID,
+            line_width=1,
+        )
+        self.chart.draw(seg)
+        prices.append(price)
+        times.append(period_start_t)
+        lines.append(seg)
+
+    # ── PPHL: push a completed period's low onto rolling buffer ───────────────
+    def _pphl_push_low(self, prices: list[float], times: list[float],
+                       lines: list[LineSegment],
+                       price: float, period_start_t: float,
+                       next_end: float) -> None:
+        if len(prices) >= PPHL_MAX_SHOWN:
+            self.chart.erase(lines[0])
+            del prices[0]
+            del times[0]
+            del lines[0]
+        seg = LineSegment(
+            AbsolutePosition(period_start_t, price),
+            AbsolutePosition(next_end, price),
+            color=COLOR_PPHL_GRAY,
+            line_style=line_style.SOLID,
+            line_width=1,
+        )
+        self.chart.draw(seg)
+        prices.append(price)
+        times.append(period_start_t)
+        lines.append(seg)
+
+    # ── PPHL: update right endpoint and show/hide for one buffer ─────────────
+    def _pphl_update_endpoints(self, prices: list[float], times: list[float],
+                               lines: list[LineSegment],
+                               next_end: float, show: bool) -> None:
+        i = 0
+        while i < len(prices):
+            price = prices[i]
+            open_t = times[i]
+            if show:
+                lines[i].point_b = AbsolutePosition(next_end, price)
+                lines[i].point_a = AbsolutePosition(open_t, price)
+            else:
+                lines[i].point_a = AbsolutePosition(0.0, nan)
+                lines[i].point_b = AbsolutePosition(0.0, nan)
+            i = i + 1
+
+    # ── PPHL: wick-touch mitigation for high buffer ───────────────────────────
+    def _pphl_mitigate_high(self, prices: list[float], times: list[float],
+                            lines: list[LineSegment],
+                            cur_high: float) -> None:
+        i = len(prices) - 1
+        while i >= 0:
+            if cur_high >= prices[i]:
+                self.chart.erase(lines[i])
+                del prices[i]
+                del times[i]
+                del lines[i]
+            i = i - 1
+
+    # ── PPHL: wick-touch mitigation for low buffer ────────────────────────────
+    def _pphl_mitigate_low(self, prices: list[float], times: list[float],
+                           lines: list[LineSegment],
+                           cur_low: float) -> None:
+        i = len(prices) - 1
+        while i >= 0:
+            if cur_low <= prices[i]:
+                self.chart.erase(lines[i])
+                del prices[i]
+                del times[i]
+                del lines[i]
+            i = i - 1
+
+    # ── PPHL draw helper ──────────────────────────────────────────────────────
+    def _pphl_draw_all(self, lines: list[LineSegment]) -> None:
+        i = 0
+        while i < len(lines):
+            self.chart.draw(lines[i])
+            i = i + 1
+
+    def calc(self, length: int, show_prev_day: bool, show_prev_week: bool,
+             show_prev_month: bool, show_prev_year: bool):
+        t0 = self.time[0]
+        bar_duration_s = self.time_frame.to_minutes() * 60
+        next_candle_end = t0 + 2 * bar_duration_s
+
+        if self.is_closed_bar:
+            # ── PivotHighLow detection ────────────────────────────────────────
+            ph, _ = PivotHighLow.new(self.high, left_bars=length, right_bars=length)
+            _, pl = PivotHighLow.new(self.low, left_bars=length, right_bars=length)
+            cur_close = self.close[0]
+
+            if not isnan(ph[0]):
+                self._last_ph_price = ph[0]
+                self._last_ph_time = self.time[length]
+            if not isnan(pl[0]):
+                self._last_pl_price = pl[0]
+                self._last_pl_time = self.time[length]
+
+            # ── Swing-point lines: add on new confirmed pivot ─────────────────
+            if not isnan(ph[0]):
+                self._add_swing_line(self.time[length], ph[0], next_candle_end,
+                                     color.GREEN, self._lines_swing_high, self._swing_high_prices)
+            if not isnan(pl[0]):
+                self._add_swing_line(self.time[length], pl[0], next_candle_end,
+                                     color.RED, self._lines_swing_low, self._swing_low_prices)
+
+            # ── Mitigate swing-point lines when price breaks them ─────────────
+            sh_lst = self._lines_swing_high.get()
+            sl_lst = self._lines_swing_low.get()
+            i = len(sh_lst) - 1
+            while i >= 0:
+                if cur_close > self._swing_high_prices[i]:
+                    self.chart.erase(sh_lst[i])
+                    del sh_lst[i]
+                    del self._swing_high_prices[i]
+                i = i - 1
+            i = len(sl_lst) - 1
+            while i >= 0:
+                if cur_close < self._swing_low_prices[i]:
+                    self.chart.erase(sl_lst[i])
+                    del sl_lst[i]
+                    del self._swing_low_prices[i]
+                i = i - 1
+
+            # ── PPHL period boundary detection + accumulation ─────────────────
+            dt = datetime.utcfromtimestamp(t0)
+            cur_day = dt.day
+            cur_day_year = dt.year
+            cur_weekday = dt.weekday()
+            cur_month = dt.month
+            cur_month_year = dt.year
+            cur_year = dt.year
+
+            cur_high = self.high[0]
+            cur_low = self.low[0]
+
+            # Accumulate into current-period H/L
+            if isnan(self._cur_day_high) or cur_high > self._cur_day_high:
+                self._cur_day_high = cur_high
+            if isnan(self._cur_day_low) or cur_low < self._cur_day_low:
+                self._cur_day_low = cur_low
+            if isnan(self._cur_day_start_t):
+                self._cur_day_start_t = t0
+
+            if isnan(self._cur_week_high) or cur_high > self._cur_week_high:
+                self._cur_week_high = cur_high
+            if isnan(self._cur_week_low) or cur_low < self._cur_week_low:
+                self._cur_week_low = cur_low
+            if isnan(self._cur_week_start_t):
+                self._cur_week_start_t = t0
+
+            if isnan(self._cur_month_high) or cur_high > self._cur_month_high:
+                self._cur_month_high = cur_high
+            if isnan(self._cur_month_low) or cur_low < self._cur_month_low:
+                self._cur_month_low = cur_low
+            if isnan(self._cur_month_start_t):
+                self._cur_month_start_t = t0
+
+            if isnan(self._cur_year_high) or cur_high > self._cur_year_high:
+                self._cur_year_high = cur_high
+            if isnan(self._cur_year_low) or cur_low < self._cur_year_low:
+                self._cur_year_low = cur_low
+            if isnan(self._cur_year_start_t):
+                self._cur_year_start_t = t0
+
+            # Day rollover
+            day_rolled = False
+            if self._last_day != -1:
+                if cur_day != self._last_day or cur_day_year != self._last_day_year:
+                    day_rolled = True
+                    if not isnan(self._cur_day_high) and not isnan(self._cur_day_start_t):
+                        self._pphl_push_high(
+                            self._day_h_prices, self._day_h_t,
+                            self._day_h_lines,
+                            self._cur_day_high, self._cur_day_start_t, next_candle_end)
+                        self._pphl_push_low(
+                            self._day_l_prices, self._day_l_t,
+                            self._day_l_lines,
+                            self._cur_day_low, self._cur_day_start_t, next_candle_end)
+                    self._cur_day_high = cur_high
+                    self._cur_day_low = cur_low
+                    self._cur_day_start_t = t0
+            self._last_day = cur_day
+            self._last_day_year = cur_day_year
+
+            if day_rolled:
+                self._day_mitigate_bars = 0
+            self._day_mitigate_bars = self._day_mitigate_bars + 1
+
+            # Week rollover
+            week_rolled = False
+            if self._last_weekday != -1:
+                if cur_weekday < self._last_weekday:
+                    week_rolled = True
+                    if not isnan(self._cur_week_high) and not isnan(self._cur_week_start_t):
+                        self._pphl_push_high(
+                            self._week_h_prices, self._week_h_t,
+                            self._week_h_lines,
+                            self._cur_week_high, self._cur_week_start_t, next_candle_end)
+                        self._pphl_push_low(
+                            self._week_l_prices, self._week_l_t,
+                            self._week_l_lines,
+                            self._cur_week_low, self._cur_week_start_t, next_candle_end)
+                    self._cur_week_high = cur_high
+                    self._cur_week_low = cur_low
+                    self._cur_week_start_t = t0
+            self._last_weekday = cur_weekday
+
+            if week_rolled:
+                self._week_mitigate_bars = 0
+            self._week_mitigate_bars = self._week_mitigate_bars + 1
+
+            # Month rollover
+            month_rolled = False
+            if self._last_month != -1:
+                if cur_month != self._last_month or cur_month_year != self._last_month_year:
+                    month_rolled = True
+                    if not isnan(self._cur_month_high) and not isnan(self._cur_month_start_t):
+                        self._pphl_push_high(
+                            self._month_h_prices, self._month_h_t,
+                            self._month_h_lines,
+                            self._cur_month_high, self._cur_month_start_t, next_candle_end)
+                        self._pphl_push_low(
+                            self._month_l_prices, self._month_l_t,
+                            self._month_l_lines,
+                            self._cur_month_low, self._cur_month_start_t, next_candle_end)
+                    self._cur_month_high = cur_high
+                    self._cur_month_low = cur_low
+                    self._cur_month_start_t = t0
+            self._last_month = cur_month
+            self._last_month_year = cur_month_year
+
+            if month_rolled:
+                self._month_mitigate_bars = 0
+            self._month_mitigate_bars = self._month_mitigate_bars + 1
+
+            # Year rollover
+            year_rolled = False
+            if self._last_year != -1:
+                if cur_year != self._last_year:
+                    year_rolled = True
+                    if not isnan(self._cur_year_high) and not isnan(self._cur_year_start_t):
+                        self._pphl_push_high(
+                            self._year_h_prices, self._year_h_t,
+                            self._year_h_lines,
+                            self._cur_year_high, self._cur_year_start_t, next_candle_end)
+                        self._pphl_push_low(
+                            self._year_l_prices, self._year_l_t,
+                            self._year_l_lines,
+                            self._cur_year_low, self._cur_year_start_t, next_candle_end)
+                    self._cur_year_high = cur_high
+                    self._cur_year_low = cur_low
+                    self._cur_year_start_t = t0
+            self._last_year = cur_year
+
+            if year_rolled:
+                self._year_mitigate_bars = 0
+            self._year_mitigate_bars = self._year_mitigate_bars + 1
+
+            # ── PPHL wick-touch mitigation (only within 3 bars of rollover) ───
+            if self._day_mitigate_bars <= 3:
+                self._pphl_mitigate_high(self._day_h_prices, self._day_h_t,
+                                         self._day_h_lines, cur_high)
+                self._pphl_mitigate_low(self._day_l_prices, self._day_l_t,
+                                        self._day_l_lines, cur_low)
+            if self._week_mitigate_bars <= 3:
+                self._pphl_mitigate_high(self._week_h_prices, self._week_h_t,
+                                         self._week_h_lines, cur_high)
+                self._pphl_mitigate_low(self._week_l_prices, self._week_l_t,
+                                        self._week_l_lines, cur_low)
+            if self._month_mitigate_bars <= 3:
+                self._pphl_mitigate_high(self._month_h_prices, self._month_h_t,
+                                         self._month_h_lines, cur_high)
+                self._pphl_mitigate_low(self._month_l_prices, self._month_l_t,
+                                        self._month_l_lines, cur_low)
+            if self._year_mitigate_bars <= 3:
+                self._pphl_mitigate_high(self._year_h_prices, self._year_h_t,
+                                         self._year_h_lines, cur_high)
+                self._pphl_mitigate_low(self._year_l_prices, self._year_l_t,
+                                        self._year_l_lines, cur_low)
+
+        # ── PPHL endpoint updates (every bar, respects per-period toggle) ─────
+        self._pphl_update_endpoints(self._day_h_prices, self._day_h_t,
+                                    self._day_h_lines, next_candle_end, show_prev_day)
+        self._pphl_update_endpoints(self._day_l_prices, self._day_l_t,
+                                    self._day_l_lines, next_candle_end, show_prev_day)
+        self._pphl_update_endpoints(self._week_h_prices, self._week_h_t,
+                                    self._week_h_lines, next_candle_end, show_prev_week)
+        self._pphl_update_endpoints(self._week_l_prices, self._week_l_t,
+                                    self._week_l_lines, next_candle_end, show_prev_week)
+        self._pphl_update_endpoints(self._month_h_prices, self._month_h_t,
+                                    self._month_h_lines, next_candle_end, show_prev_month)
+        self._pphl_update_endpoints(self._month_l_prices, self._month_l_t,
+                                    self._month_l_lines, next_candle_end, show_prev_month)
+        self._pphl_update_endpoints(self._year_h_prices, self._year_h_t,
+                                    self._year_h_lines, next_candle_end, show_prev_year)
+        self._pphl_update_endpoints(self._year_l_prices, self._year_l_t,
+                                    self._year_l_lines, next_candle_end, show_prev_year)
+
+        # ── Swing-point lines: update right endpoint every bar ────────────────
+        sh_lst = self._lines_swing_high.get()
+        sl_lst = self._lines_swing_low.get()
+        i = 0
+        while i < len(sh_lst):
+            sh_lst[i].point_b = AbsolutePosition(next_candle_end, self._swing_high_prices[i])
+            i = i + 1
+        i = 0
+        while i < len(sl_lst):
+            sl_lst[i].point_b = AbsolutePosition(next_candle_end, self._swing_low_prices[i])
+            i = i + 1
+
+        if self.is_last_bar or self.is_realtime:
+            self._pphl_draw_all(self._day_h_lines)
+            self._pphl_draw_all(self._day_l_lines)
+            self._pphl_draw_all(self._week_h_lines)
+            self._pphl_draw_all(self._week_l_lines)
+            self._pphl_draw_all(self._month_h_lines)
+            self._pphl_draw_all(self._month_l_lines)
+            self._pphl_draw_all(self._year_h_lines)
+            self._pphl_draw_all(self._year_l_lines)
+            i = 0
+            while i < len(sh_lst):
+                self.chart.draw(sh_lst[i])
+                i = i + 1
+            i = 0
+            while i < len(sl_lst):
+                self.chart.draw(sl_lst[i])
+                i = i + 1
+
+        return nan

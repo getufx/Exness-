@@ -1,0 +1,182 @@
+# indie:lang_version = 5
+import math
+from indie import (
+    indicator, MainContext, sec_context, param_ref, param, source,
+    color, plot, Color, TimeFrame, MutSeriesF, Optional
+)
+from indie.algorithms import Ema, Rsi, Atr
+from indie.drawings import LabelRel, RelativePosition, vertical_anchor as va, horizontal_anchor as ha
+
+
+@sec_context
+@param_ref('fast_ema_period')
+@param_ref('slow_ema_period')
+@param_ref('rsi_period')
+@param_ref('bull_rsi_threshold')
+@param_ref('bear_rsi_threshold')
+@param_ref('atr_period')
+def SecMain(self, fast_ema_period, slow_ema_period, rsi_period, bull_rsi_threshold, bear_rsi_threshold, atr_period):
+    ema_fast = Ema.new(self.close, fast_ema_period)
+    ema_slow = Ema.new(self.close, slow_ema_period)
+    rsi = Rsi.new(self.close, rsi_period)
+    atr = Atr.new(atr_period)
+
+    retrace_active_bull = MutSeriesF.new(init=0.0)
+    retrace_active_bear = MutSeriesF.new(init=0.0)
+
+    ef = ema_fast[0]
+    es = ema_slow[0]
+    r0 = rsi[0]
+    r1 = rsi[1]
+    a0 = atr[0]
+    c0 = self.close[0]
+    o0 = self.open[0]
+
+    ef_valid = not math.isnan(ef)
+    es_valid = not math.isnan(es)
+    r0_valid = not math.isnan(r0)
+    r1_valid = not math.isnan(r1)
+    a0_valid = not math.isnan(a0)
+
+    is_bull = ef_valid and es_valid and ef > es
+    is_bear = ef_valid and es_valid and ef < es
+
+    # Update retracement active state
+    new_active_bull = retrace_active_bull[1]
+    if math.isnan(new_active_bull):
+        new_active_bull = 0.0
+    new_active_bear = retrace_active_bear[1]
+    if math.isnan(new_active_bear):
+        new_active_bear = 0.0
+
+    if is_bull and r0_valid and r0 < bull_rsi_threshold:
+        new_active_bull = 1.0
+    if not is_bull:
+        new_active_bull = 0.0
+
+    if is_bear and r0_valid and r0 > bear_rsi_threshold:
+        new_active_bear = 1.0
+    if not is_bear:
+        new_active_bear = 0.0
+
+    retrace_active_bull[0] = new_active_bull
+    retrace_active_bear[0] = new_active_bear
+
+    # ATR filter: bar movement > 0.3 * ATR
+    atr_filter = False
+    if a0_valid and a0 > 0.0:
+        bar_move = abs(c0 - o0) if (not math.isnan(c0) and not math.isnan(o0)) else 0.0
+        atr_filter = bar_move > 0.3 * a0
+
+    # Detect retracement end
+    bull_end = 0.0
+    bear_end = 0.0
+
+    c0_valid = not math.isnan(c0)
+
+    if (is_bull and r0_valid and r1_valid
+            and retrace_active_bull[1] >= 1.0
+            and r0 > 50.0 and r1 <= 50.0
+            and c0_valid and ef_valid and c0 > ef
+            and atr_filter):
+        bull_end = 1.0
+
+    if (is_bear and r0_valid and r1_valid
+            and retrace_active_bear[1] >= 1.0
+            and r0 < 50.0 and r1 >= 50.0
+            and c0_valid and ef_valid and c0 < ef
+            and atr_filter):
+        bear_end = 1.0
+
+    trend_dir = 0.0
+    if is_bull:
+        trend_dir = 1.0
+    elif is_bear:
+        trend_dir = -1.0
+
+    ema20_out = ef if ef_valid else 0.0
+
+    return bull_end, bear_end, trend_dir, ema20_out
+
+
+@indicator('4H Trend Retracement End', overlay_main_pane=True)
+@param.int('fast_ema_period', default=20, min=1, title='4H Fast EMA')
+@param.int('slow_ema_period', default=50, min=1, title='4H Slow EMA')
+@param.int('rsi_period', default=14, min=1, title='4H RSI Period')
+@param.float('bull_rsi_threshold', default=45.0, min=1.0, max=99.0, title='Bull Retrace RSI Low')
+@param.float('bear_rsi_threshold', default=55.0, min=1.0, max=99.0, title='Bear Retrace RSI High')
+@param.int('atr_period', default=14, min=1, title='4H ATR Period')
+@param.int('h1_fast_ema', default=9, min=1, title='1H Fast EMA')
+@param.int('h1_slow_ema', default=21, min=1, title='1H Slow EMA')
+@plot.line('ema9_line', color=color.RED, line_width=1)
+@plot.line('ema21_line', color=color.BLACK, line_width=1)
+@plot.marker('Bull Retrace End', color=color.BLACK, style=plot.marker_style.CIRCLE, size=1, position=plot.marker_position.BELOW)
+@plot.marker('Bear Retrace End', color=color.RED, style=plot.marker_style.CIRCLE, size=1, position=plot.marker_position.ABOVE)
+
+class Main(MainContext):
+    def __init__(self, fast_ema_period, slow_ema_period, rsi_period, bull_rsi_threshold, bear_rsi_threshold, atr_period, h1_fast_ema, h1_slow_ema):
+        self._bull_end_s, self._bear_end_s, self._trend_dir_s, self._ema20_s = self.calc_on(SecMain, time_frame=TimeFrame.from_str('4h'))
+        self._trend_label = LabelRel(
+            "4H Trend: NEUTRAL",
+            RelativePosition(va.TOP, ha.RIGHT, 0.9, 0.8),
+            bg_color=color.GRAY(0.5),
+            text_color=color.BLACK,
+            font_size=1
+        )
+        self._last_trend_dir: float = 999.0
+
+    def calc(self, fast_ema_period, slow_ema_period, rsi_period, bull_rsi_threshold, bear_rsi_threshold, atr_period, h1_fast_ema, h1_slow_ema):
+        bull_end = self._bull_end_s[0]
+        bear_end = self._bear_end_s[0]
+        trend_dir = self._trend_dir_s[0]
+
+        # 1H EMAs
+        ema9 = Ema.new(self.close, h1_fast_ema)
+        ema21 = Ema.new(self.close, h1_slow_ema)
+
+        # Background color based on 4H trend
+        bg_color: Color = color.TRANSPARENT
+        if not math.isnan(trend_dir):
+            if trend_dir > 0.5:
+                bg_color = color.GREEN(0.05)
+            elif trend_dir < -0.5:
+                bg_color = color.RED(0.05)
+
+        # Trend label text
+        label_text = "4H Trend: NEUTRAL"
+        label_bg = color.GRAY(0.5)
+        if not math.isnan(trend_dir):
+            if trend_dir > 0.5:
+                label_text = "4H Trend: BULLISH ▲"
+                label_bg = color.GREEN(0.6)
+            elif trend_dir < -0.5:
+                label_text = "4H Trend: BEARISH ▼"
+                label_bg = color.RED(0.6)
+
+        if trend_dir != self._last_trend_dir or self.is_last_bar:
+            self._trend_label.text = label_text
+            self._trend_label.bg_color = label_bg
+            self._last_trend_dir = trend_dir
+            self.chart.draw(self._trend_label)
+
+        # Bull marker
+        bull_marker_val = math.nan
+        bull_marker_text = ""
+        if not math.isnan(bull_end) and bull_end >= 1.0:
+            bull_marker_val = self.low[0]
+            bull_marker_text = "▲ 4H Retrace End"
+
+        # Bear marker
+        bear_marker_val = math.nan
+        bear_marker_text = ""
+        if not math.isnan(bear_end) and bear_end >= 1.0:
+            bear_marker_val = self.high[0]
+            bear_marker_text = "▼ 4H Retrace End"
+
+        return (
+            ema9[0],
+            ema21[0],
+            plot.Marker(value=bull_marker_val, text=bull_marker_text),
+            plot.Marker(value=bear_marker_val, text=bear_marker_text),
+          
+        )
