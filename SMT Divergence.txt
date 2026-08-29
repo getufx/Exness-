@@ -1,0 +1,231 @@
+# indie:lang_version = 5
+from indie import indicator, MainContext, sec_context, param, color, line_style, Optional
+from indie.drawings import LineSegment, AbsolutePosition, LabelRel, RelativePosition, vertical_anchor, horizontal_anchor
+from math import nan, isnan
+
+@sec_context
+def SecMain(self):
+    return self.high[0], self.low[0]
+
+def _normalize_ticker(raw: str) -> str:
+    t = raw.upper()
+    t = t.replace('/', '')
+    t = t.replace('-', '')
+    t = t.replace('.P', '')
+    n = len(t)
+    if n >= 4 and t[n - 4:n] == 'USDT':
+        t = t[0:n - 1]
+    return t
+
+def _lookup_corr(normalized: str) -> str:
+    pairs = [
+        'XAUUSD', 'XAGUSD',
+        'XAGUSD', 'XAUUSD',
+        'EURUSD', 'GBPUSD',
+        'GBPUSD', 'EURUSD',
+        'AUDUSD', 'NZDUSD',
+        'NZDUSD', 'AUDUSD',
+        'USDCHF', 'USDCAD',
+        'USDCAD', 'USDCHF',
+        'USDJPY', 'USDCHF',
+        'GBPJPY', 'EURJPY',
+        'BZDUSD', 'AUDUSD',
+        'BTCUSD', 'ETH/USDT',
+        'ETHUSD', 'BTCUSD',
+        'DXY', 'EURUSD',
+    ]
+    i = 0
+    while i < len(pairs) - 1:
+        if pairs[i] == normalized:
+            return pairs[i + 1]
+        i = i + 2
+    return 'XAGUSD'
+
+@indicator('SMT Divergence', overlay_main_pane=True)
+@param.str('corr_ticker', default='AUTO', title='Correlated Asset Ticker (AUTO = auto-detect)')
+@param.str('corr_exchange', default='', title='Correlated Exchange (blank = chart exchange)')
+@param.str('corr_suffix', default='', title='Symbol Suffix')
+@param.int('swing_len', default=5, min=2, max=20, title='Swing Lookback')
+@param.bool('show_bull', default=True, title='Show Bullish Divergence')
+@param.bool('show_bear', default=True, title='Show Bearish Divergence')
+@param.color('bull_color', default=color.BLACK, title='Bullish Line Color')
+@param.color('bear_color', default=color.BLACK, title='Bearish Line Color')
+class Main(MainContext):
+    def __init__(self, corr_ticker, corr_exchange, corr_suffix, swing_len, show_bull, show_bear, bull_color, bear_color):
+        normalized = _normalize_ticker(self.info.ticker)
+        auto_corr = _lookup_corr(normalized)
+        active_corr: str = auto_corr if corr_ticker == 'AUTO' else corr_ticker
+        if active_corr == normalized:
+            active_corr = 'XAGUSD'
+        full_ticker: str = active_corr + corr_suffix
+        exch_arg: Optional[str] = None
+        if len(corr_exchange) > 0:
+            exch_arg = corr_exchange
+        self._sec_high, self._sec_low = self.calc_on(SecMain, exchange=exch_arg, ticker=full_ticker)
+
+        # Pre-allocate 4 LineSegment slots with nan coords: 0-1 bull, 2-3 bear.
+        # Slots are mutated in place — no erase/create cycle, no Var rollback issues.
+        _hidden = AbsolutePosition(time=0.0, price=nan)
+        self._lines: list[LineSegment] = [
+            LineSegment(_hidden, _hidden, color=color.GREEN, line_style=line_style.SOLID, line_width=1),
+            LineSegment(_hidden, _hidden, color=color.GREEN, line_style=line_style.SOLID, line_width=1),
+            LineSegment(_hidden, _hidden, color=color.RED, line_style=line_style.SOLID, line_width=1),
+            LineSegment(_hidden, _hidden, color=color.RED, line_style=line_style.SOLID, line_width=1),
+        ]
+
+        self._main_ph_price: float = nan
+        self._main_ph_time: float = nan
+        self._main_pl_price: float = nan
+        self._main_pl_time: float = nan
+        self._prev_main_ph_price: float = nan
+        self._prev_main_ph_time: float = nan
+        self._prev_main_pl_price: float = nan
+        self._prev_main_pl_time: float = nan
+        self._sec_ph_price: float = nan
+        self._sec_ph_time: float = nan
+        self._sec_pl_price: float = nan
+        self._sec_pl_time: float = nan
+        self._prev_sec_ph_price: float = nan
+        self._prev_sec_ph_time: float = nan
+        self._prev_sec_pl_price: float = nan
+        self._prev_sec_pl_time: float = nan
+        self._bull_idx: int = 0
+        self._bear_idx: int = 0
+        self._main_ticker: str = normalized
+        self._full_ticker: str = full_ticker
+        self._last_signal: str = 'None'
+        self._info_label: LabelRel = LabelRel(
+            '--- SMT Divergence ---\nActive Pair: ' + normalized + ' / ' + full_ticker + '\nSignal: None',
+            RelativePosition(vertical_anchor.BOTTOM, horizontal_anchor.LEFT, 0.95, 0.02),
+            text_color=color.BLACK,
+            bg_color=color.rgba(0, 0, 0, 0.7),
+        )
+
+    def _is_pivot_high(self, idx: int, length: int) -> bool:
+        pivot_val = self.high[idx]
+        if isnan(pivot_val):
+            return False
+        i = 1
+        while i <= length:
+            lv = self.high[idx + i]
+            rv = self.high[idx - i]
+            if isnan(lv) or isnan(rv):
+                return False
+            if pivot_val <= lv or pivot_val <= rv:
+                return False
+            i = i + 1
+        return True
+
+    def _is_pivot_low(self, idx: int, length: int) -> bool:
+        pivot_val = self.low[idx]
+        if isnan(pivot_val):
+            return False
+        i = 1
+        while i <= length:
+            lv = self.low[idx + i]
+            rv = self.low[idx - i]
+            if isnan(lv) or isnan(rv):
+                return False
+            if pivot_val >= lv or pivot_val >= rv:
+                return False
+            i = i + 1
+        return True
+
+    def _is_sec_pivot_high(self, idx: int, length: int) -> bool:
+        pivot_val = self._sec_high[idx]
+        if isnan(pivot_val):
+            return False
+        i = 1
+        while i <= length:
+            lv = self._sec_high[idx + i]
+            rv = self._sec_high[idx - i]
+            if isnan(lv) or isnan(rv):
+                return False
+            if pivot_val <= lv or pivot_val <= rv:
+                return False
+            i = i + 1
+        return True
+
+    def _is_sec_pivot_low(self, idx: int, length: int) -> bool:
+        pivot_val = self._sec_low[idx]
+        if isnan(pivot_val):
+            return False
+        i = 1
+        while i <= length:
+            lv = self._sec_low[idx + i]
+            rv = self._sec_low[idx - i]
+            if isnan(lv) or isnan(rv):
+                return False
+            if pivot_val >= lv or pivot_val >= rv:
+                return False
+            i = i + 1
+        return True
+
+    def calc(self, corr_ticker, corr_exchange, corr_suffix, swing_len, show_bull, show_bear, bull_color, bear_color):
+        min_bars = swing_len * 2 + 1
+        if self.bar_index < min_bars:
+            if self.is_last_bar:
+                self.chart.draw(self._info_label)
+            return
+
+        conf_idx = swing_len
+        if self._is_pivot_high(conf_idx, swing_len):
+            self._prev_main_ph_price = self._main_ph_price
+            self._prev_main_ph_time = self._main_ph_time
+            self._main_ph_price = self.high[conf_idx]
+            self._main_ph_time = self.time[conf_idx]
+        if self._is_pivot_low(conf_idx, swing_len):
+            self._prev_main_pl_price = self._main_pl_price
+            self._prev_main_pl_time = self._main_pl_time
+            self._main_pl_price = self.low[conf_idx]
+            self._main_pl_time = self.time[conf_idx]
+        if self._is_sec_pivot_high(conf_idx, swing_len):
+            self._prev_sec_ph_price = self._sec_ph_price
+            self._prev_sec_ph_time = self._sec_ph_time
+            self._sec_ph_price = self._sec_high[conf_idx]
+            self._sec_ph_time = self.time[conf_idx]
+        if self._is_sec_pivot_low(conf_idx, swing_len):
+            self._prev_sec_pl_price = self._sec_pl_price
+            self._prev_sec_pl_time = self._sec_pl_time
+            self._sec_pl_price = self._sec_low[conf_idx]
+            self._sec_pl_time = self.time[conf_idx]
+
+        if (show_bull
+                and self._is_pivot_low(conf_idx, swing_len)
+                and not isnan(self._main_pl_price) and not isnan(self._prev_main_pl_price)
+                and not isnan(self._sec_pl_price) and not isnan(self._prev_sec_pl_price)):
+            if self._main_pl_price < self._prev_main_pl_price and self._sec_pl_price >= self._prev_sec_pl_price:
+                # Mutate the slot in place — ring buffer with 2 bull slots (indices 0-1)
+                slot = self._lines[self._bull_idx % 2]
+                slot.point_a = AbsolutePosition(time=self._prev_main_pl_time, price=self._prev_main_pl_price)
+                slot.point_b = AbsolutePosition(time=self._main_pl_time, price=self._main_pl_price)
+                slot.color = bull_color
+                self._bull_idx = self._bull_idx + 1
+                self._last_signal = 'Bullish'
+                self._info_label.text = ('--- SMT Divergence ---\n'
+                    + 'Active Pair: ' + self._main_ticker + ' / ' + self._full_ticker + '\n'
+                    + 'Signal: ' + self._last_signal)
+
+        if (show_bear
+                and self._is_pivot_high(conf_idx, swing_len)
+                and not isnan(self._main_ph_price) and not isnan(self._prev_main_ph_price)
+                and not isnan(self._sec_ph_price) and not isnan(self._prev_sec_ph_price)):
+            if self._main_ph_price > self._prev_main_ph_price and self._sec_ph_price <= self._prev_sec_ph_price:
+                # Mutate the slot in place — ring buffer with 2 bear slots (indices 2-3)
+                slot = self._lines[2 + self._bear_idx % 2]
+                slot.point_a = AbsolutePosition(time=self._prev_main_ph_time, price=self._prev_main_ph_price)
+                slot.point_b = AbsolutePosition(time=self._main_ph_time, price=self._main_ph_price)
+                slot.color = bear_color
+                self._bear_idx = self._bear_idx + 1
+                self._last_signal = 'Bearish'
+                self._info_label.text = ('--- SMT Divergence ---\n'
+                    + 'Active Pair: ' + self._main_ticker + ' / ' + self._full_ticker + '\n'
+                    + 'Signal: ' + self._last_signal)
+
+        # On the last bar, draw all 4 slots (unused slots have nan coords and are invisible)
+        if self.is_last_bar:
+            k = 0
+            while k < 4:
+                self.chart.draw(self._lines[k])
+                k = k + 1
+            self.chart.draw(self._info_label)
