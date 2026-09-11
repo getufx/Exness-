@@ -139,9 +139,9 @@ def _make_cache(capacity: int) -> list[list[float]]:
 	return result
 @indicator('SMC — BOS + FVG/IFVG', overlay_main_pane=True)
 @plot.line('_placeholder', color=color.TRANSPARENT)
-@param.int('length', default=5, min=1, max=20, title='Pivot Length')
+@param.int('length', default=3, min=1, max=20, title='Pivot Length')
 @param.int('max_fvgs', default=7, min=1, max=10, title='Max FVGs')
-@param.bool('show_fvgs', default=True, title='Show FVGs')
+@param.bool('show_fvgs', default=False, title='Show FVGs')
 @param.bool('show_ifvgs', default=True, title='Show IFVGs')
 @param.int('max_ifvgs', default=5, min=1, max=7, title='Max IFVGs')
 @param.str('mode', default='Present', options=['Present', 'Historical'], title='Mode')
@@ -455,7 +455,7 @@ class Main(MainContext):
 				swing_low = self._last_pl_price
 				swing_range = swing_high - swing_low
 				if swing_range > 0.0:
-					fib_color: Color = color.GREEN
+					fib_color: Color = color.rgba(255,255,0,0)
 					dir_label = 'Bull '
 					fib1_price: float = nan
 					fib2_price: float = nan
