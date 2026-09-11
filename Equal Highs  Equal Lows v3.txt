@@ -32,8 +32,8 @@ from indie.algorithms import PivotHighLow
 from indie.drawings import LineSegment, AbsolutePosition, LabelAbs, callout_position
 MAX_LEVELS_CAPACITY = 10
 MAX_CANDIDATES = 20
-_EQH_COLOR = color.rgba(0, 0, 0, 0.5)
-_EQL_COLOR = color.rgba(0, 0, 0, 0.5)
+_EQH_COLOR = color.rgba(18, 0, 0, 0.5)
+_EQL_COLOR = color.rgba(0, 18, 0, 0.5)
 @indicator('EQ', overlay_main_pane=True)
 @plot.line('_placeholder', color=color.TRANSPARENT)
 @param.int('pivot_length', default=5, min=1, max=20, title='Pivot Length')
@@ -67,14 +67,14 @@ class Main(MainContext):
                 AbsolutePosition(0.0, nan),
                 color=_EQH_COLOR,
                 line_style=line_style.SOLID,
-                line_width=1,
+                line_width=5,
             ))
             self._eql_lines.append(LineSegment(
                 AbsolutePosition(0.0, nan),
                 AbsolutePosition(0.0, nan),
                 color=_EQL_COLOR,
                 line_style=line_style.SOLID,
-                line_width=1,
+                line_width=5,
             ))
             self._eqh_labels.append(LabelAbs(
                 "",
